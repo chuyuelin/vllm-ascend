@@ -18,6 +18,7 @@ from typing import Callable, Optional
 
 import torch
 import torch_npu
+from vllm.triton_utils import tl, triton
 from vllm.forward_context import get_forward_context
 
 
@@ -305,7 +306,7 @@ def _native_select_experts(
     return topk_weights, topk_ids
 
 
-def zero_experts_compute(
+def zero_experts_compute_triton(
     expert_indices: torch.Tensor,
     expert_scales: torch.Tensor,
     num_experts: int,
@@ -328,3 +329,82 @@ def zero_experts_compute(
     expert_scales = torch.where(normal_expert_mask, 0.0, expert_scales)
 
     return expert_indices, expert_scales, result
+
+
+def zero_experts_compute(
+        expert_indices: torch.Tensor,
+        expert_scales: torch.Tensor,
+        num_experts: int,
+        zero_expert_type: str,
+        hidden_states: torch.Tensor,
+):
+    N = expert_indices.numel()
+    top_k = expert_indices.size(-1)
+    grid = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE"]),)
+
+    if zero_expert_type == "identity":
+        zero_expert_mask = expert_indices < num_experts
+        zero_expert_scales = expert_scales.clone()
+        zero_expert_scales = torch.where(zero_expert_mask, 0.0,
+                                         zero_expert_scales)
+
+    normal_expert_mask = expert_indices >= num_experts
+    expert_indices = torch.where(normal_expert_mask, 0, expert_indices)
+    expert_scales = torch.where(normal_expert_mask, 0.0, expert_scales)
+
+    output = torch.zeros_like(hidden_states).to(hidden_states.device)
+    hidden_dim = hidden_states.size(-1)
+    num_tokens = hidden_states.size(0)
+
+    grid = lambda meta: (num_tokens * (hidden_dim // meta["BLOCK_SIZE"]),)
+    compute_identity_kernel[grid](
+        top_k,
+        hidden_states,
+        zero_expert_scales,
+        num_tokens,
+        output,
+        hidden_dim,
+        zero_expert_scales.stride(0),
+        BLOCK_SIZE=256,
+    )
+
+    return expert_indices, expert_scales, output
+
+
+@triton.jit
+def compute_identity_kernel(
+        top_k: int,
+        hidden_states_ptr: tl.tensor,
+        expert_scales_ptr: tl.tensor,
+        num_tokens: int,
+        output_ptr: tl.tensor,
+        hidden_dim: int,
+        scales_stride: int,
+        BLOCK_SIZE: tl.constexpr,
+) -> None:
+    pid = tl.program_id(0)
+
+    batch_id = pid // (hidden_dim // BLOCK_SIZE)
+    dim_offset = pid % (hidden_dim // BLOCK_SIZE) * BLOCK_SIZE
+
+    if batch_id >= num_tokens or dim_offset >= hidden_dim:
+        return
+
+    h = tl.load(
+        hidden_states_ptr
+        + batch_id * hidden_dim
+        + dim_offset
+        + tl.arange(0, BLOCK_SIZE),
+        mask=(dim_offset + tl.arange(0, BLOCK_SIZE)) < hidden_dim,
+    )
+
+    result = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    for i in range(top_k):
+        scale = tl.load(expert_scales_ptr + batch_id * scales_stride + i)
+        result += h * scale
+
+    tl.store(
+        output_ptr + batch_id * hidden_dim + dim_offset + tl.arange(0, BLOCK_SIZE),
+        result,
+        mask=(dim_offset + tl.arange(0, BLOCK_SIZE)) < hidden_dim,
+    )
