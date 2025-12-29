@@ -449,9 +449,6 @@ class AscendMLAMetadataBuilder:
                     model.model.start_layer].self_attn[0].rotary_emb.cos_cached
                 self.sin_cache = model.model.layers[
                     model.model.start_layer].self_attn[0].rotary_emb.sin_cached
-                # TODO
-
-                torch.save("")
             else:
                 self.cos_cache = model.model.layers[
                     model.model.start_layer].self_attn.rotary_emb.cos_cached
